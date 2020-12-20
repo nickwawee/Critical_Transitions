@@ -1,5 +1,5 @@
 # Critical Transitions
-This repo will contain select material regarding the analysis of the developmental trajectory of liver cells. It includes dimensionality reduction, implementation of a custom time series model, and visualizations.
+This repo will contain select material regarding the analysis of the developmental trajectory of liver cells. It includes dimensionality reduction, implementation of a custom time series model, and visualizations. Large files were removed from the repo. The report document explains the entire project.
 
 ## Future Work
 Listed below are improvements that could be done to the algorithm workflow.

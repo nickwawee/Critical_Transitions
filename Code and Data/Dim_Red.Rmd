@@ -1,0 +1,363 @@
+---
+title: "Monocle Implementation"
+author: "Nick Wawee"
+date: "July 26, 2018"
+output:
+  pdf_document: default
+  html_document: default
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+rm(list=ls())
+knitr::opts_chunk$set(echo = TRUE)
+library("ggplot2")
+library("monocle")
+library("R.utils")
+library("Biobase")
+library("plyr")
+library("dplyr")
+library("forecast")
+
+mat2numericmat<-function(mat){# this function converts a matrix of class matrix to a numeric matrix
+  if (class(mat)=="matrix"){
+    newmat<-matrix(0, length(mat[,1]),length(mat[1,]))
+    cnames<-colnames(mat)
+    rnames<-rownames(mat)
+    for (i in 1:length(newmat[,1])){
+      newmat[i,]<-sapply(mat[i,],as.numeric)
+    }
+    row.names(newmat)<-rnames
+    colnames(newmat)<-cnames
+    mat2numericmat<-newmat
+  }else{stop('the matrix is not of the matrix class. class(mat)!=matrix')}
+}
+diff_fun<-function(vec){
+  diff_vec<-rep(0,length(vec))
+  for (ii in 2:length(vec)){
+    diff_vec[ii]=vec[ii]-vec[ii-1] 
+  }
+  diff_vec=diff_vec[-1]
+  diff_fun<-diff_vec
+}
+
+idandname<-function(idnamemat, geneid, genename){#This function returns the desired gene name(s) or id(s) with the input of a matrix that has row names corresponding to each gene identifier and the 1st column contains the respective short name
+  if (geneid=="NA"){
+    geneid.r=rownames(idnamemat)[match(genename,idnamemat[,1])]
+    return(geneid.r)
+  }
+  if (genename=="NA"){
+    genename.r=idnamemat[match(geneid,rownames(idnamemat)),1]
+    return(genename.r)
+  }
+  
+}
+```
+#TPM Data
+
+This script takes TPM data from a single cell data set and processes it through Monocle which reduces the dimensionality of the data and constructs a pseudotime trajectory. It also utilizes the visualization functions within Monocle to qualitatively identify which state belongs to the Hepatoblasts, Hepatocytes, and Cholangiocytes. The script outputs a table that contains all cells and expressed genes in pseudo-chronological order as well as the state designation corresponding to each cell.
+
+
+The dataset from the Yang article closely resembles the 1st definition which is
+$$TPM_i^j=\frac{(\frac{R_i}{L_i}*10^6)}{\sum_{i}^{\forall i \in j} (\frac{R_i}{L_i})_j}$$
+Where i= gene designation, j = cell designation,  Ri= Read count of gene i , Li = Length of gene i (bp) according to reference genome, $\forall i \in j$ =  All Genes existing in cell j. Li is the length of the gene found from the reference genome. In the Yang article, this is the mus musculus genome (GRCm38/mm10). Monocle advises to use TPM counts when available; an understanding of how TPM values are determined provides biological meaning to the data.
+
+
+#Code
+
+The TPM gene by cell matrix is loaded available by Yang et al[1].
+
+```{r loading, include = F}
+rawtpm<-read.table("/Users/nickwawee/Desktop/MSU/Critical Transitions Draft & Documents/Code and Data/Single-cell_RNA-seq_TPM.txt", fill=TRUE)
+```
+
+Next the phenoData (annotated dataframe containing data pertinent to all in vivo cells) and featureData (annotated dataframe containing data pertinent to all genes) are constructed from the matrix. A numeric gene by cell matrix is constructed with column names that are labeled by each cell and row names that contain the names of each gene identifier. The user-defined function mat2numericmat() is used to convert character matrix to numeric matrix.
+
+```{r fd pd and nm}
+
+#featureData
+fdmat<-as.character(unlist(rawtpm[2:40917,2]))
+fdmat<-as.matrix(fdmat)
+row.names(fdmat)<-as.character(unlist(rawtpm[2:40917,1]))
+colnames(fdmat)<-"gene_short_name"
+fdmat<-as.data.frame(fdmat)
+fd <- new("AnnotatedDataFrame", data = fdmat)
+
+#phenoData
+pdmat<-as.character(unlist(rawtpm[1,3:449]))
+pdmat<-as.matrix(pdmat)
+rownames(pdmat)<-as.character(unlist(pdmat))
+colnames(pdmat)<-"Cell_Name"
+row.names(pdmat)<-as.character(unlist(rawtpm[1,3:449]))
+pdmat<-as.data.frame(pdmat)
+pd <- new("AnnotatedDataFrame", data = pdmat)
+
+#numeric matrix
+tidymat<-rawtpm[2:40917,3:449]
+tidymat<-(as.matrix(tidymat))
+row.names(tidymat)<-as.character(rownames(fdmat))
+colnames(tidymat)<-as.character(rownames(pdmat))
+nummat<-mat2numericmat(tidymat)
+
+```
+
+##Monocle Creation, Filtering, Dimensionality Reduction, and Ordering of the Dataset
+
+A new cell data-set is then created using the monocle package[2]. The `tobit()` expression family is used because the expression data is in TPM and a relative measure of expression per cell.
+
+```{r new cds}
+vivocds<-newCellDataSet(nummat,phenoData= pd, featureData= fd, expressionFamily=tobit())
+```
+
+Genes are filtered such that they have to have at least 1 TPM in 10 cells. The ERCC spike-in readings are removed, and the dataset is trimmed down to 16738 expressed genes
+
+```{r gene filtering}
+vivocds<-detectGenes(vivocds, min_expr = 1)#detects relative gene expression for all vivo cells w/ TPM >=1
+expressed_genes<-row.names(subset(fData(vivocds),num_cells_expressed>=10))
+expressed_genes<-expressed_genes[-grep("ERCC", expressed_genes)]# removes ERCC spike-in genes
+vivocds<-vivocds[expressed_genes,]
+```
+
+The cell dataset then goes under dimensionality reduction using DDRTree, an algorithm that is default for Monocle 2. The number of components reduced to is set to 2. The `relative_expr` is set to false indicating that the expression data should not be converted to relative expression data because it already is TPM. Succeeding the dimensionality reduction, the cells are each assigned a value of pseudotime that is a measure of how far along they are from the trajectory.
+
+```{r dr and pt}
+#dimensionality reduction with DDRTree
+vivocds<-reduceDimension(vivocds, max_components = 2, reduction_method = "DDRTree", relative_expr = FALSE)
+#construction of pseudotime trajectory
+vivocds<-orderCells(vivocds)
+```
+
+The manifold displaying each cell is analyzed in conjunction with jitter plots that indicate each cellular state. Gene expression levels of the genes active in the cell cycle, hepatoblast, hepatocyte, and cholangiocyte are depicted in each state. 
+
+```{r ids and stuff, include=FALSE}
+#identifying genes for visualization
+## gene designations- makes it so that genes can be tagged
+Afp_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Afp",fdmat[,1]),1]))
+Afp_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Afp",fdmat[,1]),1]))
+Alb_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Alb",fdmat[,1]),1]))
+Foxa2_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Foxa2",fdmat[,1]),1]))
+Hnf4a_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Hnf4a",fdmat[,1]),1]))
+Sox9_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Sox9",fdmat[,1]),1]))
+Krt7_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Krt7",fdmat[,1]),1]))
+Foxm1_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Foxm1",fdmat[,1]),1]))
+Ccna2_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Ccna2",fdmat[,1]),1]))
+Ccnb1_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Ccnb1",fdmat[,1]),1]))
+Ccne2_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Ccne2",fdmat[,1]),1]))
+Cdk1_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Cdk1",fdmat[,1]),1]))
+Id3_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Id3",fdmat[,1]),1]))
+Lin28b_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Lin28b",fdmat[,1]),1]))
+Etv5_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Etv5",fdmat[,1]),1]))
+Lgr5_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Lgr5",fdmat[,1]),1]))
+Tbx3_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Tbx3",fdmat[,1]),1]))
+Ppara_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Ppara",fdmat[,1]),1]))
+Rora_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Rora",fdmat[,1]),1]))
+Thrb_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Thrb",fdmat[,1]),1]))
+Cux2_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Cux2",fdmat[,1]),1]))
+Nr1i3_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Nr1i3",fdmat[,1]),1]))
+Esr1_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Esr1",fdmat[,1]),1]))
+Nr1h4_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Nr1h4",fdmat[,1]),1]))
+Ahr_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Ahr",fdmat[,1]),1]))
+Stat6_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Stat6",fdmat[,1]),1]))
+Foxq1_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Foxq1",fdmat[,1]),1]))
+Nfia_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Nfia",fdmat[,1]),1]))
+Tbx3_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Tbx3",fdmat[,1]),1]))
+Zbtb16_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Zbtb16",fdmat[,1]),1]))
+Crebl2_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Crebl2",fdmat[,1]),1]))
+Bhlhe40_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Bhlhe40",fdmat[,1]),1]))
+Zbtb20_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Zbtb20",fdmat[,1]),1]))
+Tox_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Tox",fdmat[,1]),1]))
+Nfib_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Nfib",fdmat[,1]),1]))
+Zfp791_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Zfp791",fdmat[,1]),1]))
+Tfcp2l1_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Tfcp2l1",fdmat[,1]),1]))
+Zhx3_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Zhx3",fdmat[,1]),1]))
+Klf9_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Klf9",fdmat[,1]),1]))
+Cebpa_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Cebpa",fdmat[,1]),1]))
+Atf5_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Atf5",fdmat[,1]),1]))
+Sox4_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Sox4",fdmat[,1]),1]))
+Hnf1b_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Hnf1b",fdmat[,1]),1]))
+Cps1_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Cps1",fdmat[,1]),1]))
+Apoh_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Apoh",fdmat[,1]),1]))
+Cyp2d10_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Cyp2d10",fdmat[,1]),1]))
+Cyp2d26_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Cyp2d26",fdmat[,1]),1]))
+Spp1_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Spp1",fdmat[,1]),1]))
+Epcam_id<-row.names(subset(fData(vivocds),gene_short_name == fdmat[match("Epcam",fdmat[,1]),1]))
+
+#cluster ids
+clustera_id<-c(Foxm1_id, Ccna2_id, Ccnb1_id, Ccne2_id, Cdk1_id)# cell cycle genes
+clusterb_id<-c(Tbx3_id, Id3_id, Lin28b_id, Etv5_id, Lgr5_id)#hepatoblast genes
+clusterc_id<-c(Cps1_id, Ppara_id, Apoh_id, Cyp2d10_id, Cyp2d26_id)#cluster c genes
+clusterd_id<-c(Sox9_id, Sox4_id, Hnf1b_id, Spp1_id, Krt7_id)#cluster d genes
+
+```
+```{r traj and jitter 1, warning=FALSE, message=FALSE}
+plot_cell_trajectory(vivocds, color_by = 'State')+
+  ggtitle('Cell Trajectory')
+
+plot_genes_jitter(vivocds[clustera_id,],grouping = "State",min_expr = 1, relative_expr = FALSE,label_by_short_name = TRUE)+
+  ggtitle('Cell Cycle Genes')
+
+plot_genes_jitter(vivocds[clusterb_id,],grouping = "State",min_expr = 1, relative_expr = FALSE,label_by_short_name = TRUE)+
+  ggtitle('Hepatoblast Genes')
+
+plot_genes_jitter(vivocds[clusterc_id,],grouping = "State",min_expr = 1, relative_expr = FALSE,label_by_short_name = TRUE)+
+  ggtitle('Hepatocyte Genes')
+
+plot_genes_jitter(vivocds[clusterd_id,],grouping = "State",min_expr = 1, relative_expr = FALSE,label_by_short_name = TRUE)+
+  ggtitle('Cholangiocyte Genes')
+```
+
+
+##Re-naming and state designation assignments
+
+After analysis, it is concluded that state 1 contains the cholangiocyte cells, state 2 contains hepatoblast cells, and state 3 contain hepatocyte cells. Since state 2 is the beginning of the trajectory, the cells are ordered such that the trajectory begins with state 2. The states are renamed with corresponding cellular designations, and the same plots are generated again for clarity.
+
+```{r plotting and ordering, warning=FALSE, message=FALSE}
+#Cell re-ordering
+vivocds<-orderCells(vivocds, root_state = 2)
+
+#Re-naming states
+State<-vivocds@phenoData$State#makes state vector
+levels(State)[levels(State)=="1"]<-"Cholangiocyte"
+levels(State)[levels(State)=="3"]<-"Hepatocyte"
+levels(State)[levels(State)=="2"]<-"Hepatoblast"
+vivocds@phenoData$State<-State#inserts new state information into the cell dataset
+State<-as.character(State)#makes state vector a character for later use
+```
+```{r traj and jitter 2, warning=FALSE, message=FALSE, echo=FALSE, fig.height = 6, fig.width = 6, units = 'in'}
+
+#Plotting
+plot_cell_trajectory(vivocds, color_by = 'State')+
+  ggtitle('Cell Trajectory')+
+  theme(legend.text = element_text(size=12), plot.title=element_text(size=16,face="bold"), legend.title=element_text(size=12, face="bold"))+
+  scale_color_discrete(name="Cell Type")
+
+plot_cell_trajectory(vivocds, color_by = 'Pseudotime')+
+  ggtitle('Cell Trajectory')+
+  theme(legend.text = element_text(size=12), plot.title=element_text(size=16,face="bold"), legend.title=element_text(size=12, face="bold"))+
+  scale_color_continuous(name="Pseudotime")
+
+plot_genes_jitter(vivocds[clustera_id,],grouping = "State",min_expr = 1, relative_expr = FALSE,label_by_short_name = TRUE)+
+  ggtitle('Cell Cycle Genes')
+
+plot_genes_jitter(vivocds[clusterb_id,],grouping = "State",min_expr = 1, relative_expr = FALSE,label_by_short_name = TRUE)+
+  ggtitle('Hepatoblast Genes')
+
+plot_genes_jitter(vivocds[clusterc_id,],grouping = "State",min_expr = 1, relative_expr = FALSE,label_by_short_name = TRUE)+
+  ggtitle('Hepatocyte Genes')
+
+plot_genes_jitter(vivocds[clusterd_id,],grouping = "State",min_expr = 1, relative_expr = FALSE,label_by_short_name = TRUE)+
+  ggtitle('Cholangiocyte Genes')
+```
+
+
+
+##Branched Pseudotime (Gene Expression)
+
+Plots depicting branched expression levels of each gene are generated for comparison of expression levels found in the Yang article. A branched heatmap is generated for the 20 genes as a supplemental visualization. Cluster 1 represents the cell cycle and hepatoblast genes, cluster 3 represents the cholangiocyte genes, and cluster 2 represents the hepatocyte genes.
+
+```{r branch plots, warning=FALSE, message=FALSE, height = 5*6/3, width = 6, units = 'in'}
+plot_genes_branched_pseudotime(vivocds[clustera_id,], branch_point = 1, color_by = "State", ncol=1)+
+  ggtitle('Cell Cycle Genes')
+plot_genes_branched_pseudotime(vivocds[clusterb_id,], branch_point = 1, color_by = "State", ncol=1)+
+  ggtitle('Hepatoblast Genes')
+plot_genes_branched_pseudotime(vivocds[clusterc_id,], branch_point = 1, color_by = "State", ncol=1)+
+  ggtitle('Hepatocyte Genes')
+plot_genes_branched_pseudotime(vivocds[clusterd_id,], branch_point = 1, color_by = "State", ncol=1)+
+  ggtitle('Cholangiocyte Genes')
+
+heatmap<-plot_genes_branched_heatmap(vivocds[c(clustera_id,clusterb_id,clusterc_id,clusterd_id),],  branch_point = 1, num_clusters = 3, cores = 1, use_gene_short_name = T, show_rownames = T, branch_labels = c("Cholangiocyte","Hepatocyte"), return_heatmap = TRUE)
+
+```
+
+
+##BEAM Testing 
+
+BEAM testing is an option that tests how the expression levels fit the branched pseudotime trajectory that is fit via a natural spline. The null hypothesis is that the gene is not a function of branched pseudotime. p and q values are produced from the test and are saved for comparison.
+
+```{r BEAM, fig.height=30, fig.width=10, warning=FALSE, message=FALSE}
+# BEAM testing- run this only if you want to run beam testing with the data set- may take a while
+beamresults<-BEAM(vivocds)
+```
+
+##Table Writing
+
+The pseudotime values for each cell is sorted in chronological order. The corresponding state designation is ordered in a similar fashion. The original matrix is ordered in the same way. The short name for each gene is added to the matrix, and the state and pseudotime designations are added as well. Tables are written for the beam results, new ordered matrix, and the expressed genes.
+
+```{r table writing}
+
+#Pseudotime ordering
+Pt<-as.data.frame(vivocds@phenoData$Pseudotime)#makes a pseudotime vector
+cellnames<-vivocds@phenoData$Cell_Name#makes vector of cell names
+row.names(Pt)<-cellnames
+Ptnum<-sort(Pt[,1])#sorts pseudotime
+cellnamesordered<-rownames(Pt)[match(Ptnum,Pt[,1])]#matches pseudotime with original values so that the cell names can be ordered
+Ptdf<-as.data.frame(Ptnum)
+row.names(Ptdf)<-cellnamesordered#makes new dataframe with ordered pseudotime names and values
+
+#State Ordering
+statedf<-as.data.frame(State)
+row.names(statedf)<-cellnames
+statedf<-as.data.frame(statedf[match(rownames(Ptdf),rownames(statedf)),])
+row.names(statedf)<-cellnamesordered
+
+#Matrix Ordering
+orderedmat<-nummat[,match(rownames(Ptdf),colnames(nummat))]#orders matrix in the pseudochronological order
+
+#Matrix Tidying
+ordereddf<-as.data.frame(orderedmat)
+ordereddf<-rbind(t(Ptdf),t(statedf),ordereddf)
+row.names(ordereddf)<-c("Pseudotime","State",rownames(ordereddf)[c(-1,-2)])
+shortnames<-as.character(fdmat[,1])# collects all short names so that they can be inserted into the first column of the matrix
+shortnamesnew<-c("Pseudotime","State",shortnames)
+ordereddf<-cbind(shortnamesnew,ordereddf)
+colnames(ordereddf)<-c("gene_short_name", colnames(ordereddf)[-1])#renames columns
+
+#Writing Tables
+write.table(beamresults, "beamresults.txt")
+write.table(ordereddf, "orderedpt.txt")
+write.table(expressed_genes,"expressed_genes.txt")
+
+expressed_genes<-cbind(expressed_genes,as.character(fdmat[match(expressed_genes, rownames(fdmat)),]))
+colnames(expressed_genes)<-c("Gene ID", "Gene Symbol")
+write.csv(expressed_genes, "Table S1.csv")
+```
+
+
+##Envrionment and References
+
+System environment is shown below
+```{r env, echo=FALSE}
+Sys.getenv()
+```
+
+###References
+
+[1] Yang, L. , Wang, W. , Qiu, W. , Guo, Z. , Bi, E. and Xu, C. (2017), A single-cell transcriptomic analysis reveals precise pathways and regulatory mechanisms underlying hepatoblast differentiation. Hepatology, 66: 1387-1401. doi:10.1002/hep.29353
+
+[2] C. Trapnell and X. Qiu, "Monocle", Cole-trapnell-lab.github.io, 2018. [Online]. Available: http://cole-trapnell-lab.github.io/monocle-release/docs/#acknowledgements. [Accessed: 11- Jun- 2018].
+
+#Additional Resources
+
+##Monocle Resources 
+http://cole-trapnell-lab.github.io/monocle-release/docs/#installing-monocle - General Information/Tutorial
+
+https://www.bioconductor.org/packages/devel/bioc/manuals/monocle/man/monocle.pdf - Detailed Documentation of Functions in Monocle
+
+##TPM Resources
+There are a view variations of the definitions of TPM as described by the follow sources:
+
+1-	https://www.rna-seqblog.com/rpkm-fpkm-and-tpm-clearly-explained/
+
+2-	https://www.biostat.wisc.edu/bmi776/lectures/rnaseq.pdf
+
+3-	https://www.biostars.org/p/273537/
+
+4-	http://assets.geneious.com/manual/8.0/GeneiousManualsu76.html
+
+5-	https://link.springer.com/article/10.1007%2Fs12064-012-0162-3 
+
+6-	https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4226227/ 
+
+
+
